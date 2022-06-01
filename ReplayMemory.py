@@ -1,21 +1,19 @@
 import numpy as np
+from collections import deque
 
 class ReplayMemory:
     def __init__ (self, max_length):
         self.max_length = max_length
         self.experience = {
-            'state' : [],
-            'action' : [],
-            'reward' : [],
-            'next_state' : [],
-            'done' : []
+            'state' : deque(maxlen=max_length),
+            'action' : deque(maxlen=max_length),
+            'reward' : deque(maxlen=max_length),
+            'next_state' : deque(maxlen=max_length),
+            'done' : deque(maxlen=max_length)
         }
 
-    def add_experience(self, experience):
-        if len(self.experience['state']) > self.max_length:
-            for key in self.experience:
-                self.experience[key].pop(0)
-        for key, value in experience.items():
+    def add_experience(self, new_experience):
+        for key, value in new_experience.items():
             self.experience[key].append(value)
 
     def get_experience(self, batch_size):

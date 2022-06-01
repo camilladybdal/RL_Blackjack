@@ -1,19 +1,29 @@
+import os
 from ReplayMemory import *
 from Blackjack import *
-from Model import *
 from utils import *
 import tensorflow as tf
-from tensorflow import keras
 import matplotlib as plt
-import logging
+import math
+
+def create_model(input_form, n_actions):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(input_form),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(n_actions, activation='linear')
+    ])
+    model.summary()
+    return model
 
 class DQN:
     def __init__(self, input, n_actions):
-        self.memory = ReplayMemory(10000)
+        self.memory = ReplayMemory(1000)
         self.batch_size = 32
-        self.min_replay_size = 100
+        self.min_replay_size = 1000
         self.n_actions = n_actions
-
         self.optimizer = tf.keras.optimizers.Adam(learning_rate= 0.001)
         self.model = create_model(input, n_actions)
         self.loss_function = tf.losses.mean_squared_error
@@ -21,23 +31,21 @@ class DQN:
     def predict(self, states):
         return self.model.predict(states, verbose = 0)
 
-    #TODO: skriv om
+    #Training function is inspired from professors's code in notebook. 
     def train(self, TargetNet, discount_factor):
         if len(self.memory.experience['state']) < self.min_replay_size:
             return
         
         states, actions, rewards, next_states, dones = self.memory.get_experience(self.batch_size)
         actions = np.array([actions_to_numbers[i] for i in actions])
-
-        next_Q_values = TargetNet.predict(next_states) 
-        max_next_Q_values = np.max(next_Q_values, axis=1)
-        target_Q_values = (rewards + discount_factor * max_next_Q_values * (1 - dones))
-        mask = tf.one_hot(actions, self.n_actions)
+        Q_next = TargetNet.predict(self.normalize_input(next_states, is_batch=True))
+        max_Q_next = np.max(Q_next, axis=1)
+        target_Q_val = (rewards + discount_factor * max_Q_next * (1 - dones))
 
         with tf.GradientTape() as tape:
-            all_Q_values = self.model(states)
-            Q_values = tf.reduce_sum(all_Q_values * mask, axis=1, keepdims=True)
-            loss = tf.reduce_mean(self.loss_function(target_Q_values, Q_values))
+            all_Q_val = self.model(self.normalize_input(states, is_batch=False))
+            Q_val = tf.reduce_sum(all_Q_val * tf.one_hot(actions, self.n_actions), axis=1, keepdims=True)
+            loss = tf.reduce_mean(self.loss_function(target_Q_val, Q_val))
         
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
@@ -49,32 +57,46 @@ class DQN:
     def load_weights(self, path):
         self.model.load_weights(path)
     
-    def copy_weights(self, TargetNet):
-        for v1, v2 in zip(self.model.trainable_variables, TargetNet.model.trainable_variables):
-            v2.assign(v1.numpy())
+    def copy_weights(self, input_net):
+        self.model.set_weights(input_net.model.get_weights())
 
-    def get_action(self, observation, epsilon): #returns action in number
+    def get_action(self, observation, epsilon, new_hand):
+        no_double = [0, 1, 3]
         if np.random.random() < epsilon:
-            return actions[np.random.randint(0, self.n_actions)]
+            if new_hand:
+                return actions[np.random.randint(0, self.n_actions)]
+            else:
+                return actions[no_double[np.random.randint(0,3)]]
         else:
             observation = np.array([observation])
-            return actions[np.argmax(self.model(observation))]
-
-#######################################################################################################
-
+            if new_hand:
+                return actions[np.argmax(self.model(self.normalize_input(observation, is_batch=False)))]
+            else:
+                no_double = (self.model(self.normalize_input(observation, is_batch=False))).numpy()[0]
+                valid_actions = [no_double[0], no_double[1], -math.inf, no_double[3]]
+                return actions[np.argmax(valid_actions)]
+        
+    def normalize_input(self, state, is_batch = False):
+        player_hand_range = 21
+        dealer_hand_range = 11
+        if is_batch:
+            for i in range(self.batch_size):
+                state[i][0] = state[i][0] / player_hand_range
+                state[i][1] = state[i][1] / dealer_hand_range
+            return np.array(state)
+        else:
+            return np.array([[state[0][0] / player_hand_range, state[0][1] / dealer_hand_range, state[0][2]]])
+            
 def dqn_train_loop(checkpoint_dir, episodes):
     CHECKPOINT_DIR = checkpoint_dir
     EPISODES = episodes
-    rewards = np.empty(EPISODES)
-    losses =  np.empty(EPISODES)
-
-    copy_step = 25
+    rewards = 0
+    copy_step = 100
     num_actions = 4
-    num_states = 4
+    num_states = 3
     input = (num_states,)
-    iterations = 0
-    gamma = 0.95
-    eps_decay = 0.9999
+    gamma = 0.9
+    eps_decay = 0.999
     eps_min = 0.1
     epsilon = 0.99
 
@@ -83,54 +105,46 @@ def dqn_train_loop(checkpoint_dir, episodes):
     TrainNet = DQN(input, num_actions)
 
     for episode in range(EPISODES):
-        print("Playing new episode: ", episode)
-        if episode < 0.2*EPISODES:
-            epsilon = max(eps_min, epsilon * eps_decay)
+        epsilon = max(eps_min, epsilon * eps_decay)
+        if (episode % 1000 == 0): print(f"Episode: {episode}\tEpsilon: {epsilon}")
 
         state = env.reset()
-
-        while not env.game_over:
-            action = TrainNet.get_action(state, epsilon)
-
+        while True:
+            action = TrainNet.get_action(state, epsilon, env.new_hand)
             prev_state = state
             state, reward, done = env.step(action)
 
             experience = {'state': prev_state, 'action': action, 'reward': reward, 'next_state': state, 'done': done}
             TrainNet.memory.add_experience(experience)
             loss = TrainNet.train(TargetNet, gamma)
-            
-            iterations += 1
-            if iterations % copy_step == 0:
-                TargetNet.copy_weights(TrainNet)
-            
-        rewards[episode] = reward
-        if loss == None: loss = 0
-        losses[episode] = loss
+            if (done): break
 
-        if episode % 500 == 0:
-            print("saved model:" , episode)
-            print("average reward: ", np.mean(rewards))
-            print("loss: ", loss.numpy())
+        if episode % copy_step == 0:
+            print("Copying weights from MainNet to TargetNet")
+            TargetNet.copy_weights(TrainNet)
 
-            TrainNet.model.save("my_model")
+        if episode % 5000 == 0:
+            print("average reward: ", rewards/(episode+1))
+            print("loss: ", loss)
+            print("Saved model")
+            TrainNet.save_weights(os.path.join(CHECKPOINT_DIR, f"main_{episode}"))
             save_strategy(TrainNet, "strategy.csv")
+        
+        rewards += reward
 
-    print("average reward: ", np.mean(rewards))
-    print("average loss: ", np.mean(loss))
-    TrainNet.save_weights(CHECKPOINT_DIR )
+    print("average reward: ", rewards/(episodes))
+    TrainNet.save_weights(os.path.join(CHECKPOINT_DIR, f"main_{episode}"))
     save_strategy(TrainNet, "strategy.csv")
-
-    plt.plot(rewards)
-    plt.label("Rewards")
-    plt.show()
 
 def dqn_test_loop(episodes):
     EPISODES = episodes
+    rewards = 0 
+    Qnet = DQN((3,), 4)
+    latest = tf.train.latest_checkpoint("checkpoints/")
+    Qnet.load_weights(latest)
+    model = Qnet.model
 
-    model = keras.models.load_model("my_model")
     env = Blackjack()
-    
-    rewards = np.empty(EPISODES)
     wins, losses, draws = 0, 0, 0
 
     for episodes in range(EPISODES):
@@ -138,10 +152,10 @@ def dqn_test_loop(episodes):
         state = np.array([state])
 
         while not env.game_over:
-            action = actions[np.argmax(model(state))]
-            state, reward, _  = env.step(action)
-            state = np.array([state])
-        
+            action = actions[np.argmax(model(Qnet.normalize_input(state, is_batch=False)))]
+            state, reward, _ = env.step(action)
+
+        rewards += reward
         if reward >= 1:
             wins += 1
         elif reward < 0:
@@ -149,9 +163,8 @@ def dqn_test_loop(episodes):
         elif reward == 0:
             draws += 1
 
-        rewards[episodes] = reward
-
+    save_strategy(model, "strategy.csv")
     print("wins: ", wins)
     print("losses: ", losses)
     print("draws: ", draws)
-    print("average reward: ", np.mean(rewards))    
+    print("average reward: ", rewards/EPISODES)
